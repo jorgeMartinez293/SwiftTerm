@@ -439,8 +439,20 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         return NSRect (x: 0, y: 0, width: cellDimension.width * CGFloat(terminal.cols) + scroller.frame.width, height: cellDimension.height * CGFloat(terminal.rows))
     }
     
+    /// When false, the scroller is hidden and its width is not subtracted from
+    /// the effective text area. This ensures the terminal reports the correct
+    /// column count when the scroller is not shown.
+    public var scrollerEnabled: Bool = true {
+        didSet {
+            scroller?.isHidden = !scrollerEnabled
+            scroller?.alphaValue = scrollerEnabled ? 1 : 0
+            processSizeChange(newSize: frame.size)
+        }
+    }
+
     func getEffectiveWidth (size: CGSize) -> CGFloat
     {
+        guard scrollerEnabled else { return size.width }
         return (size.width-scroller.frame.width)
     }
     
@@ -678,8 +690,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
                     default: break
                     }
                 }
-                send (EscapeSequences.cmdEsc)
-                send (txt: rawCharacter)
+                // If Option produces a different character than the base key (e.g. Option+3 → '#'
+                // on Spanish Apple keyboards), send that composed character directly instead of
+                // treating it as a Meta key (ESC + base). This allows typing '#', '@', etc.
+                if let composedCharacter = event.characters, composedCharacter != rawCharacter {
+                    send (txt: composedCharacter)
+                } else {
+                    send (EscapeSequences.cmdEsc)
+                    send (txt: rawCharacter)
+                }
             }
             return
         } else if eventFlags.contains (.control) {
@@ -1368,11 +1387,50 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         if event.deltaY == 0 {
             return
         }
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
-            scrollUp (lines: velocity)
+
+        // If the application has mouse reporting enabled, forward scroll as button press events
+        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+            let hit = calculateMouseHit(with: event)
+            let displayBuffer = terminal.displayBuffer
+            let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
+
+            // Determine number of scroll lines based on input type
+            let scrollLines: Int
+            if event.hasPreciseScrollingDeltas {
+                // Trackpad: fine-grained deltas, scale down to discrete steps
+                scrollLines = max(1, Int(abs(event.scrollingDeltaY) / 4.0))
+            } else {
+                scrollLines = max(1, Int(abs(event.deltaY)))
+            }
+
+            // Button 4 = Scroll Up, Button 5 = Scroll Down (X11 convention)
+            let button = event.deltaY > 0 ? 4 : 5
+            let flags = event.modifierFlags
+            let encoded = terminal.encodeButton(
+                button: button,
+                release: false,
+                shift: flags.contains(.shift),
+                meta: flags.contains(.option),
+                control: flags.contains(.control)
+            )
+
+            for _ in 0..<scrollLines {
+                terminal.sendEvent(
+                    buttonFlags: encoded,
+                    x: hit.grid.col,
+                    y: screenRow,
+                    pixelX: hit.pixels.col,
+                    pixelY: hit.pixels.row
+                )
+            }
         } else {
-            scrollDown(lines: velocity)
+            // Normal scroll-back through terminal history
+            let velocity = calcScrollingVelocity(delta: Int(abs(event.deltaY)))
+            if event.deltaY > 0 {
+                scrollUp(lines: velocity)
+            } else {
+                scrollDown(lines: velocity)
+            }
         }
     }
     
@@ -1428,7 +1486,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     func drawImageInStripe (image: TTImage, srcY: CGFloat, width: CGFloat, srcHeight: CGFloat, dstHeight: CGFloat, size: CGSize) -> TTImage? {
         guard let bitmapImage = NSBitmapImageRep (
                 bitmapDataPlanes: nil,
-                pixelsWide: Int(size.width), pixelsHigh: Int(size.height),
+                pixelsWide: max(1, Int(size.width)), pixelsHigh: max(1, Int(size.height)),
                 bitsPerSample: 8, samplesPerPixel: 4,
                 hasAlpha: true, isPlanar: false,
                 colorSpaceName: NSColorSpaceName.calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0) else {
@@ -1584,6 +1642,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case .reportWindowTitle:
             return nil
         case .reportTerminalWindowPixelDimension:
+            return nil
+        default:
             return nil
         }
     }
