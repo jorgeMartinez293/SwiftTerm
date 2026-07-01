@@ -100,6 +100,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     private var progressBarView: TerminalProgressBarView?
     private var progressReportTimer: Timer?
     private var lastProgressValue: UInt8?
+    var animationTimer: Timer?
 
     var selection: SelectionService!
     private var scroller: NSScroller!
