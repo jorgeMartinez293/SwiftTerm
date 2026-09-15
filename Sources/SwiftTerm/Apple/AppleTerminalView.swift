@@ -1085,7 +1085,7 @@ extension TerminalView {
                                       y: rowBase - CGFloat (image.pixelHeight) + offsetY,
                                       width: CGFloat (image.pixelWidth),
                                       height: CGFloat (image.pixelHeight))
-                    image.currentStripe.draw (in: rect)
+                    image.draw (in: rect)
                 }
             }
 
@@ -1208,7 +1208,7 @@ extension TerminalView {
                                       y: rowBase - CGFloat (image.pixelHeight) + offsetY,
                                       width: CGFloat (image.pixelWidth),
                                       height: CGFloat (image.pixelHeight))
-                    image.currentStripe.draw (in: rect)
+                    image.draw (in: rect)
                 }
             }
             if !otherImages.isEmpty {
@@ -1218,7 +1218,7 @@ extension TerminalView {
                                       y: rowBase - CGFloat (image.pixelHeight),
                                       width: CGFloat (image.pixelWidth),
                                       height: CGFloat (image.pixelHeight))
-                    image.currentStripe.draw (in: rect)
+                    image.draw (in: rect)
                 }
             }
             switch renderMode {
@@ -1666,23 +1666,44 @@ extension TerminalView {
         send (terminal.applicationCursor ? EscapeSequences.moveRightApp : EscapeSequences.moveRightNormal)
     }
     
-    // Decodes every frame of an animated GIF up front and tracks which one is
-    // currently active. Shared by every per-row AppleImage stripe that belongs
-    // to the same inline image placement, so a frame only advances once per
-    // tick regardless of how many terminal rows the image spans.
-    class AnimatedImageSource {
+    // Decoded frames of an animated GIF plus its timeline. Instances are cached by the
+    // image's bytes (see `shared(for:)`), so every placement of the same GIF -- in any row,
+    // any terminal view, any window -- shares one decoded copy. The current frame is derived
+    // from a shared start time rather than advanced per view, which keeps every copy on
+    // screen in sync and lets a single clock (`ImageAnimationClock`) drive all of them.
+    final class AnimatedImageSource {
         let frames: [TTImage]
-        let delays: [TimeInterval]
-        private(set) var currentFrameIndex = 0
-        private var accumulated: TimeInterval = 0
+        /// End time of each frame, measured from the start of a loop.
+        private let frameEnds: [TimeInterval]
+        private let loopDuration: TimeInterval
+        private let startTime = ProcessInfo.processInfo.systemUptime
 
-        init? (data: Data) {
+        private struct WeakSource {
+            weak var source: AnimatedImageSource?
+        }
+        // Weak, so a GIF's frames are freed as soon as the last placement using them is gone.
+        private static var cache: [Data: WeakSource] = [:]
+
+        /// The shared source for `data`, decoding it only if no live placement already did.
+        /// Returns nil for anything that isn't a multi-frame image.
+        static func shared (for data: Data) -> AnimatedImageSource? {
+            if let cached = cache [data]?.source {
+                return cached
+            }
+            guard let source = AnimatedImageSource (data: data) else { return nil }
+            cache = cache.filter { $0.value.source != nil }
+            cache [data] = WeakSource (source: source)
+            return source
+        }
+
+        private init? (data: Data) {
             guard let source = CGImageSourceCreateWithData (data as CFData, nil) else { return nil }
             let frameCount = CGImageSourceGetCount (source)
             guard frameCount > 1 else { return nil }
 
             var frames: [TTImage] = []
-            var delays: [TimeInterval] = []
+            var frameEnds: [TimeInterval] = []
+            var elapsed: TimeInterval = 0
             for i in 0..<frameCount {
                 guard let cgImage = CGImageSourceCreateImageAtIndex (source, i, nil) else { return nil }
                 #if os(macOS)
@@ -1691,33 +1712,97 @@ extension TerminalView {
                 frames.append (TTImage (cgImage: cgImage))
                 #endif
 
+                // Browsers treat a delay of 10ms or less as "unspecified" and use 100ms.
                 var delay = 0.1
                 if let properties = CGImageSourceCopyPropertiesAtIndex (source, i, nil) as? [String: Any],
                    let gifProperties = properties [kCGImagePropertyGIFDictionary as String] as? [String: Any] {
-                    if let t = gifProperties [kCGImagePropertyGIFUnclampedDelayTime as String] as? Double, t > 0 {
+                    if let t = gifProperties [kCGImagePropertyGIFUnclampedDelayTime as String] as? Double, t > 0.01 {
                         delay = t
-                    } else if let t = gifProperties [kCGImagePropertyGIFDelayTime as String] as? Double, t > 0 {
+                    } else if let t = gifProperties [kCGImagePropertyGIFDelayTime as String] as? Double, t > 0.01 {
                         delay = t
                     }
                 }
-                delays.append (delay)
+                elapsed += delay
+                frameEnds.append (elapsed)
             }
             self.frames = frames
-            self.delays = delays
+            self.frameEnds = frameEnds
+            self.loopDuration = elapsed
         }
 
-        // Advances the current frame if enough time has passed. Returns true when
-        // the frame index changed, so the caller knows a redraw is needed.
-        func advance (by interval: TimeInterval) -> Bool {
-            accumulated += interval
-            guard accumulated >= delays [currentFrameIndex] else { return false }
-            accumulated = 0
-            currentFrameIndex = (currentFrameIndex + 1) % frames.count
-            return true
+        /// The frame showing at `time` (a `systemUptime` value), and how long until it changes.
+        func frame (at time: TimeInterval) -> (index: Int, remaining: TimeInterval) {
+            let t = max (0, time - startTime).truncatingRemainder (dividingBy: loopDuration)
+            var low = 0
+            var high = frameEnds.count - 1
+            while low < high {
+                let mid = (low + high) / 2
+                if frameEnds [mid] > t {
+                    high = mid
+                } else {
+                    low = mid + 1
+                }
+            }
+            return (low, frameEnds [low] - t)
+        }
+    }
+
+    // The one clock behind every animated inline image in the process. Terminal views that
+    // received an animated image register themselves (weakly); each tick asks every
+    // registered view to redraw the rows whose animation moved to a new frame. The timer is
+    // one-shot and re-armed for the next frame change among the animations actually on
+    // screen, so it only wakes up when there is something to draw, polls slowly while
+    // everything is hidden, and stops for good once no registered view is left.
+    final class ImageAnimationClock {
+        static let shared = ImageAnimationClock ()
+
+        private static let minimumInterval: TimeInterval = 1.0/60.0
+        /// How often to check back while no animation is visible (occluded or minimized
+        /// windows, images scrolled out of view), so they resume promptly once they are.
+        private static let idleInterval: TimeInterval = 0.25
+
+        private struct WeakView {
+            weak var view: TerminalView?
+        }
+        private var views: [WeakView] = []
+        private var timer: Timer?
+
+        func register (_ view: TerminalView) {
+            if !views.contains (where: { $0.view === view }) {
+                views.append (WeakView (view: view))
+            }
+            if timer == nil {
+                schedule (after: Self.minimumInterval)
+            }
+        }
+
+        private func schedule (after interval: TimeInterval) {
+            let timer = Timer (timeInterval: interval, repeats: false) { [weak self] _ in
+                self?.tick ()
+            }
+            RunLoop.main.add (timer, forMode: .common)
+            self.timer = timer
+        }
+
+        private func tick () {
+            timer = nil
+            views.removeAll { $0.view == nil }
+            guard !views.isEmpty else { return }
+
+            let now = ProcessInfo.processInfo.systemUptime
+            var next = Self.idleInterval
+            for entry in views {
+                if let view = entry.view, let remaining = view.redrawChangedAnimationFrames (at: now) {
+                    next = min (next, remaining)
+                }
+            }
+            schedule (after: max (Self.minimumInterval, next))
         }
     }
 
     class AppleImage: TerminalImage, KittyPlacementImage {
+        /// macOS: the whole placed image, of which this row shows `unitSourceRect`.
+        /// Elsewhere: this row's pre-rendered stripe.
         var image: TTImage
         var pixelWidth: Int
         var pixelHeight: Int
@@ -1734,28 +1819,75 @@ extension TerminalView {
         var kittyPixelOffsetX: Int = 0
         var kittyPixelOffsetY: Int = 0
 
-        // Animation support: when this stripe belongs to an animated GIF placement,
-        // `frameStripes` holds this row's slice pre-cut from every frame of the GIF
-        // (same crop/scale as `image`, just from a different source frame), and
-        // `animationSource` (shared by every row of the same placement) tracks which
-        // frame is currently active.
+        #if os(macOS)
+        /// The part of the source image (or of each animation frame) this row shows, in
+        /// unit coordinates of that image (y up). It may extend past 0...1 -- the image's
+        /// last row, or letterboxing when the aspect ratio is preserved -- and that part
+        /// draws nothing. Cropping at draw time instead of pre-rendering a bitmap per row
+        /// (per frame, for animations) makes placing an image nearly free.
+        var unitSourceRect = CGRect (x: 0, y: 0, width: 1, height: 1)
+        #else
+        /// This row's slice pre-cut from every frame of the animation.
         var frameStripes: [TTImage]?
+        #endif
+        /// Set for rows of an animated placement; shared with every other placement of the
+        /// same GIF.
         var animationSource: AnimatedImageSource?
-
-        // The stripe that should be drawn right now: the pre-cut frame for the
-        // animation's current index, or the static stripe if this image isn't animated.
-        var currentStripe: TTImage {
-            if let animationSource, let frameStripes, animationSource.currentFrameIndex < frameStripes.count {
-                return frameStripes[animationSource.currentFrameIndex]
-            }
-            return image
-        }
+        /// Animation frame this row last drew, so the clock only redraws rows that are stale.
+        var drawnFrameIndex: Int?
 
         init (image: TTImage, width: Int, height: Int, onCol: Int) {
             self.image = image
             self.pixelWidth = width
             self.pixelHeight = height
             self.col = onCol
+        }
+
+        func draw (in rect: CGRect) {
+            let frameIndex = animationSource?.frame (at: ProcessInfo.processInfo.systemUptime).index
+            drawnFrameIndex = frameIndex
+            #if os(macOS)
+            var source = image
+            if let animationSource, let frameIndex {
+                source = animationSource.frames [frameIndex]
+            }
+            let size = source.size
+            guard size.width > 0, size.height > 0 else { return }
+            let requested = CGRect (x: unitSourceRect.minX * size.width, y: unitSourceRect.minY * size.height,
+                                    width: unitSourceRect.width * size.width, height: unitSourceRect.height * size.height)
+            let sourceRect = requested.intersection (CGRect (origin: .zero, size: size))
+            guard !sourceRect.isNull, sourceRect.width > 0, sourceRect.height > 0 else { return }
+            // Shrink the destination by however much of the requested region fell outside the image.
+            let destRect = CGRect (x: rect.minX + (sourceRect.minX - requested.minX) / requested.width * rect.width,
+                                   y: rect.minY + (sourceRect.minY - requested.minY) / requested.height * rect.height,
+                                   width: sourceRect.width / requested.width * rect.width,
+                                   height: sourceRect.height / requested.height * rect.height)
+
+            // Enlarging with smooth interpolation blurs pixel art, so keep hard pixel edges
+            // whenever the image is drawn at least at its native resolution; shrinking keeps
+            // the default filtering so large images don't alias.
+            guard let context = NSGraphicsContext.current else {
+                source.draw (in: destRect, from: sourceRect, operation: .sourceOver, fraction: 1)
+                return
+            }
+            var pixelsPerPoint = CGSize (width: 1, height: 1)
+            if let rep = source.representations.first, rep.pixelsWide > 0, rep.pixelsHigh > 0 {
+                pixelsPerPoint = CGSize (width: CGFloat (rep.pixelsWide) / size.width, height: CGFloat (rep.pixelsHigh) / size.height)
+            }
+            let devicePixels = context.cgContext.convertToDeviceSpace (destRect).size
+            let enlarges = abs (devicePixels.width) >= sourceRect.width * pixelsPerPoint.width
+                && abs (devicePixels.height) >= sourceRect.height * pixelsPerPoint.height
+            let previousInterpolation = context.imageInterpolation
+            context.imageInterpolation = enlarges ? .none : .default
+            source.draw (in: destRect, from: sourceRect, operation: .sourceOver, fraction: 1)
+            context.imageInterpolation = previousInterpolation
+            #else
+            if let frameIndex, let frameStripes, frameIndex < frameStripes.count {
+                frameStripes [frameIndex].draw (in: rect)
+            } else {
+                image.draw (in: rect)
+            }
+            #endif
         }
     }
     // Computes the number of columns and rows used by the image
@@ -1764,51 +1896,55 @@ extension TerminalView {
                 rows: Int ((size.height+cellDimension.height-1)/cellDimension.height))
     }
 
-    // Drives inline GIF animations. A single timer is shared by every animated
-    // placement in the view; each tick advances every *distinct* AnimatedImageSource
-    // found in the visible rows (deduped, since a GIF spanning N rows shares one
-    // source across N AppleImage stripes) and redraws only if a frame changed.
-    static let animationTickInterval: TimeInterval = 1.0/30.0
-
-    func startAnimationTimer () {
-        guard animationTimer == nil else { return }
-        let timer = Timer (timeInterval: TerminalView.animationTickInterval, repeats: true) { [weak self] _ in
-            self?.tickAnimations ()
-        }
-        RunLoop.main.add (timer, forMode: .common)
-        animationTimer = timer
+    #if os(macOS)
+    private var isShowingAnimations: Bool {
+        guard let window, window.isVisible, window.occlusionState.contains (.visible) else { return false }
+        return !isHiddenOrHasHiddenAncestor
     }
-
-    func stopAnimationTimer () {
-        animationTimer?.invalidate ()
-        animationTimer = nil
+    #else
+    private var isShowingAnimations: Bool {
+        window != nil && !isHidden
     }
+    #endif
 
-    private func tickAnimations () {
-        guard let terminal else { return }
+    /// Called by `ImageAnimationClock`: invalidates the visible rows whose animated images
+    /// last drew a frame other than the current one. Returns how long until the next frame
+    /// change among the visible animations, or nil if none is on screen.
+    func redrawChangedAnimationFrames (at time: TimeInterval) -> TimeInterval? {
+        guard let terminal, isShowingAnimations else { return nil }
         let displayBuffer = terminal.displayBuffer
         let firstRow = displayBuffer.yDisp
         let lastRow = min (firstRow + terminal.rows, displayBuffer.lines.count)
-        guard firstRow < lastRow else { return }
+        guard firstRow < lastRow else { return nil }
 
-        var seen = Set<ObjectIdentifier> ()
-        var needsRedraw = false
+        var frames: [ObjectIdentifier: (index: Int, remaining: TimeInterval)] = [:]
+        var nextChange: TimeInterval?
+        var staleRows: (first: Int, last: Int)?
         for row in firstRow..<lastRow {
             guard let images = displayBuffer.lines [row].images else { continue }
             for case let image as AppleImage in images {
                 guard let source = image.animationSource else { continue }
                 let id = ObjectIdentifier (source)
-                guard seen.insert (id).inserted else { continue }
-                if source.advance (by: TerminalView.animationTickInterval) {
-                    needsRedraw = true
+                let current = frames [id] ?? source.frame (at: time)
+                frames [id] = current
+                nextChange = min (nextChange ?? current.remaining, current.remaining)
+                if image.drawnFrameIndex != current.index {
+                    staleRows = (staleRows?.first ?? row, row)
                 }
             }
         }
-        if needsRedraw {
+        if let staleRows {
+            #if os(macOS)
+            let height = cellDimension.height
+            let top = frame.height - height * CGFloat (staleRows.first - firstRow)
+            let bottom = frame.height - height * CGFloat (staleRows.last - firstRow + 1)
+            setNeedsDisplay (CGRect (x: 0, y: bottom, width: bounds.width, height: top - bottom))
+            #else
             setNeedsDisplay (bounds)
+            #endif
         }
+        return nextChange
     }
-
 
     public func createImageFromBitmap(source: Terminal, bytes: inout [UInt8], width: Int, height: Int) {
         let rgbColorSpace = CGColorSpaceCreateDeviceRGB()
@@ -1838,17 +1974,17 @@ extension TerminalView {
         guard let img = TTImage(data: data) else {
             return
         }
-        let animatedSource = AnimatedImageSource (data: data)
+        let animatedSource = AnimatedImageSource.shared (for: data)
         if animatedSource != nil {
-            startAnimationTimer ()
+            ImageAnimationClock.shared.register (self)
         }
         insertImage (img, width: widthRequest, height: heightRequest, preserveAspectRatio: preserveAspectRatio, animatedSource: animatedSource)
     }
 
     // Inserts the specified image at the current buffer position (x, y) using the specified size requests
     // and aspect ratio request.   The insertion is done by adding slices of the image, one per line
-    // to the buffer.  When `animatedSource` is provided, each row also gets a pre-cut
-    // stripe for every frame of the animation (see AppleImage.currentStripe).
+    // to the buffer.  When `animatedSource` is provided, the rows draw from its frames
+    // instead of from `image` (see AppleImage.draw).
     func insertImage (_ image: TTImage, width widthRequest: ImageSizeRequest, height heightRequest: ImageSizeRequest, preserveAspectRatio: Bool, animatedSource: AnimatedImageSource? = nil)
     {
         let buffer = terminal.buffer
@@ -1908,6 +2044,10 @@ extension TerminalView {
             heightImageSize = img.size.height
         }
 
+        #if os(macOS)
+        // Where the image sits within the width x height placement, in unit coordinates.
+        var unitContentRect = CGRect (x: 0, y: 0, width: 1, height: 1)
+        #endif
         var width = getPixels (fromDim: widthRequest, regionSize: frame.width, imageSize: widthImageSize, cellSize: cellDimension.width)
         var height = getPixels (fromDim: heightRequest, regionSize: frame.height, imageSize: heightImageSize, cellSize: cellDimension.height)
         
@@ -1920,7 +2060,21 @@ extension TerminalView {
             case (.auto, _):
                 width = (height * img.size.width) / img.size.height
             case (_, _):
+                #if os(macOS)
+                // Letterbox the image inside width x height (same fit as `scale(image:size:)`)
+                // by mapping rows onto it at draw time, instead of rendering a scaled copy.
+                let srcRatio = img.size.height/img.size.width
+                let scaledRatio = width/height
+                if srcRatio < scaledRatio {
+                    let nw = (height * img.size.width) / img.size.height
+                    unitContentRect = CGRect (x: (width-nw)/2/width, y: 0, width: nw/width, height: 1)
+                } else {
+                    let nh = (width * img.size.height) / img.size.width
+                    unitContentRect = CGRect (x: 0, y: (height-nh)/2/height, width: 1, height: nh/height)
+                }
+                #else
                 img = scale (image: img, size: CGSize (width: width, height: height))
+                #endif
             }
         }
         
@@ -1949,24 +2103,29 @@ extension TerminalView {
         
         let stripeSize = CGSize (width: width, height: cellDimension.height)
         var didScroll = false
-        #if os(iOS) || os(visionOS)
-        var srcY: CGFloat = 0
+        #if os(macOS)
+        let unitRowHeight = cellDimension.height / height
         #else
-        var srcY: CGFloat = img.size.height
-        #endif
-        
+        var srcY: CGFloat = 0
         let heightRatio = img.size.height/height
-        for _ in 0..<rows {
+        #endif
+
+        for row in 0..<rows {
             #if os(macOS)
-            srcY -= cellDimension.height * heightRatio
-            #endif
+            // Row `row` covers this band of the placement (y up), mapped into image coordinates.
+            let bandY = 1 - CGFloat (row + 1) * unitRowHeight
+            let attachedImage = AppleImage (image: img, width: Int (stripeSize.width), height: Int (cellDimension.height), onCol: terminal.buffer.x)
+            attachedImage.unitSourceRect = CGRect (x: -unitContentRect.minX / unitContentRect.width,
+                                                   y: (bandY - unitContentRect.minY) / unitContentRect.height,
+                                                   width: 1 / unitContentRect.width,
+                                                   height: unitRowHeight / unitContentRect.height)
+            attachedImage.animationSource = animatedSource
+            #else
             let stripeSrcY = srcY
             guard let stripe = drawImageInStripe (image: img, srcY: stripeSrcY, width: width, srcHeight: cellDimension.height * heightRatio, dstHeight: cellDimension.height, size: stripeSize) else {
                 continue
             }
-            #if os(iOS) || os(visionOS)
             srcY += cellDimension.height * heightRatio
-            #endif
 
             let attachedImage = AppleImage (image: stripe, width: Int (stripeSize.width), height: Int (cellDimension.height), onCol: terminal.buffer.x)
             if let animatedSource {
@@ -1975,6 +2134,7 @@ extension TerminalView {
                     drawImageInStripe (image: frame, srcY: stripeSrcY, width: width, srcHeight: cellDimension.height * heightRatio, dstHeight: cellDimension.height, size: stripeSize) ?? stripe
                 }
             }
+            #endif
             if let context = placementContext {
                 attachedImage.kittyIsKitty = true
                 attachedImage.kittyImageId = context.imageId
