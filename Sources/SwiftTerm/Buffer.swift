@@ -692,6 +692,14 @@ public final class Buffer {
                 continue
             }
 
+            // These lines are about to be merged by copying CharData between BufferLine
+            // objects (below); attached images (col-only positioning, no CharData marker)
+            // can't be moved along with their content, so drop them rather than let them
+            // render detached over whatever text ends up in their place.
+            for idx in y..<i {
+                clearImagesFromLine(at: idx)
+            }
+
             // Copy buffer data to new locations
             var destLineIndex = 0
             var destCol = getWrappedLineTrimmedLength (lines, destLineIndex, oldCols)
@@ -927,6 +935,16 @@ public final class Buffer {
                 continue
             }
             let linesToAdd = destLineLengths.count - wrappedLines.count
+
+            // These lines are about to be redistributed by copying CharData between
+            // BufferLine objects (below); attached images (col-only positioning, no
+            // CharData marker) can't be moved along with their content, so drop them
+            // rather than let them render detached over whatever text ends up in their
+            // place. Must happen before `wrappedLines` grows with the blank lines added
+            // below, so the range covers only the original (pre-existing) lines.
+            for idx in y..<(y + wrappedLines.count) {
+                clearImagesFromLine(at: idx)
+            }
 
             var trimmedLines: Int
             if yBase == 0 && self.y != lines.count - 1 {
