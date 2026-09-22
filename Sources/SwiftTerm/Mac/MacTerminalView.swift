@@ -528,11 +528,44 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         window?.makeFirstResponder (self)
     }
 
+    /// While the window is being live-resized, resize the terminal's grid only once the
+    /// frame has held still for this long, and when the live resize ends, instead of on
+    /// every intermediate frame. Each grid change reflows the buffer and signals the
+    /// program inside (SIGWINCH); a stream of them makes full-screen programs redraw for
+    /// sizes that are already stale, leaving mangled lines behind. Zero (the default)
+    /// resizes on every frame change.
+    public var liveResizeCoalescingInterval: TimeInterval = 0
+
+    private var pendingSizeChange: DispatchWorkItem?
+
     open override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
         updateScrollerFrame()
         updateCursorPosition()
         updateProgressBarFrame()
+        if liveResizeCoalescingInterval > 0 && inLiveResize {
+            pendingSizeChange?.cancel ()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.pendingSizeChange = nil
+                self.processSizeChange(newSize: self.frame.size)
+            }
+            pendingSizeChange = work
+            DispatchQueue.main.asyncAfter (deadline: .now() + liveResizeCoalescingInterval, execute: work)
+        } else {
+            applyPendingSizeChange ()
+        }
+    }
+
+    open override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        applyPendingSizeChange ()
+    }
+
+    /// Resizes the grid to the current frame now, dropping any coalesced resize.
+    private func applyPendingSizeChange () {
+        pendingSizeChange?.cancel ()
+        pendingSizeChange = nil
         processSizeChange(newSize: frame.size)
     }
 

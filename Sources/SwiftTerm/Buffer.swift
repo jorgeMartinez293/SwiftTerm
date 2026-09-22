@@ -226,6 +226,54 @@ public final class Buffer {
         }
     }
 
+    /// Removes every row of any image whose rows no longer sit on consecutive lines
+    /// (lines inserted between them, some of them scrolled within a region, ...), so an
+    /// image is either shown whole and in place or not at all. Only lines from
+    /// `startLine` on are considered. As with `BufferLine.replaceImageCells`, emptied
+    /// arrays are left in place to keep the line count in step.
+    func removeTornImages (fromLine startLine: Int = 0)
+    {
+        guard hasAnyImages else { return }
+        let first = max (0, startLine)
+        guard first < lines.count else { return }
+        var offsets: [ObjectIdentifier: Int] = [:]
+        var torn = Set<ObjectIdentifier> ()
+        for i in first..<lines.count {
+            guard let images = lines [i].images else { continue }
+            for image in images {
+                guard let placementRow = image.placementRow else { continue }
+                let offset = i - placementRow.row
+                if let previous = offsets [placementRow.placement] {
+                    if previous != offset {
+                        torn.insert (placementRow.placement)
+                    }
+                } else {
+                    offsets [placementRow.placement] = offset
+                }
+            }
+        }
+        guard !torn.isEmpty else { return }
+        for i in first..<lines.count {
+            let line = lines [i]
+            guard let images = line.images else { continue }
+            let kept = images.filter { image in
+                guard let placementRow = image.placementRow else { return true }
+                return !torn.contains (placementRow.placement)
+            }
+            if kept.count != images.count {
+                line.images = kept
+            }
+        }
+    }
+
+    /// Removes torn images (see `removeTornImages`) around the visible screen: the lines
+    /// that on-screen operations such as inserting, deleting or scrolling lines within a
+    /// region can move, plus a screenful above for images that straddle its top.
+    func removeTornImagesNearScreen ()
+    {
+        removeTornImages (fromLine: yBase - rows)
+    }
+
     /// Recalculates the count of lines with images (used after reflow operations)
     func recalculateLinesWithImagesCount() {
         var count = 0
@@ -508,6 +556,7 @@ public final class Buffer {
                 }
             }
         }
+        removeTornImages ()
         
         // DEBUG: Post-condition
         if lines.count > 0 {
@@ -909,6 +958,12 @@ public final class Buffer {
             var nextLine = lines [y]
             let lineLength = nextLine.getTrimmedLength ()
             if !nextLine.isWrapped && lineLength <= newCols {
+                continue
+            }
+            // A line holding a row of an image is left unwrapped (its text past the new
+            // width is cut off by the trim that follows the reflow): wrapping it would
+            // insert lines between that image's rows and tear it apart.
+            if !nextLine.isWrapped && nextLine.hasTextCoveredImages {
                 continue
             }
 

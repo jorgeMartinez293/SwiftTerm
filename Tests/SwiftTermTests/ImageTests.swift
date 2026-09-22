@@ -17,6 +17,25 @@ struct MockTerminalImage: TerminalImage {
     var col: Int = 0
 }
 
+/// A mock image that occupies text cells, like an iTerm2 inline image or sixel.
+final class MockCellImage: TerminalImage {
+    var pixelWidth: Int = 100
+    var pixelHeight: Int = 10
+    var col: Int
+    var textCoveredColumns: Int
+    var replacedColumns = IndexSet ()
+    var placement: AnyObject?
+    var row: Int = 0
+    var placementRow: (placement: ObjectIdentifier, row: Int)? {
+        placement.map { (ObjectIdentifier ($0), row) }
+    }
+
+    init (col: Int, columns: Int) {
+        self.col = col
+        self.textCoveredColumns = columns
+    }
+}
+
 final class ImageTests {
 
     @Test func testSixel() {
@@ -249,6 +268,166 @@ final class ImageTrackingTests: TerminalDelegate {
         terminal.feed(text: "\u{1b}[?1049l")
         #expect(terminal.altBuffer.hasAnyImages == false, "Alt buffer should be cleared")
         #expect(terminal.normalBuffer.hasAnyImages == true, "Normal buffer should still have images")
+    }
+}
+// MARK: - Text replacing cell images
+
+final class CellImageReplacementTests: TerminalDelegate {
+    func send(source: Terminal, data: ArraySlice<UInt8>) {}
+
+    /// Places a 4-row image covering columns 2..<7 on rows 0...3 of the visible screen.
+    private func makeTerminal () -> (Terminal, [MockCellImage]) {
+        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 20, rows: 10))
+        var images: [MockCellImage] = []
+        let placement = NSObject ()
+        for row in 0..<4 {
+            let image = MockCellImage (col: 2, columns: 5)
+            image.placement = placement
+            image.row = row
+            terminal.buffer.attachImage (image, toLineAt: terminal.buffer.yBase + row)
+            images.append (image)
+        }
+        return (terminal, images)
+    }
+
+    private func imageCount (_ terminal: Terminal, row: Int) -> Int {
+        terminal.buffer.lines [terminal.buffer.yBase + row].images?.count ?? 0
+    }
+
+    @Test func testEraseLineRemovesImageRow () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[2;1H\u{1b}[2K")
+        #expect (imageCount (t, row: 0) == 1)
+        #expect (imageCount (t, row: 1) == 0)
+        #expect (imageCount (t, row: 2) == 1)
+    }
+
+    @Test func testEraseBelowRemovesImageRows () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[3;1H\u{1b}[J")
+        #expect (imageCount (t, row: 0) == 1)
+        #expect (imageCount (t, row: 1) == 1)
+        #expect (imageCount (t, row: 2) == 0)
+        #expect (imageCount (t, row: 3) == 0)
+    }
+
+    @Test func testEraseToEndOfLineOutsideImageKeepsIt () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[1;8H\u{1b}[K")
+        #expect (imageCount (t, row: 0) == 1)
+        #expect (images [0].replacedColumns.isEmpty)
+    }
+
+    @Test func testTextOverImageReplacesOnlyWrittenCells () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[1;4Hab")
+        #expect (imageCount (t, row: 0) == 1)
+        #expect (images [0].replacedColumns == IndexSet (integersIn: 1..<3))
+
+        // Writing the rest of the covered cells removes that row of the image.
+        t.feed (text: "\u{1b}[1;1Hxxxxxxxx")
+        #expect (imageCount (t, row: 0) == 0)
+    }
+
+    @Test func testNonAsciiTextOverImageReplacesCells () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[2;3H\u{00e9}\u{4e2d}")
+        #expect (images [1].replacedColumns == IndexSet (integersIn: 0..<3))
+    }
+
+    @Test func testCursorMovesAroundImageKeepIt () {
+        let (t, images) = makeTerminal ()
+        // fastfetch-style: skip past the image with cursor-forward, then print.
+        t.feed (text: "\u{1b}[1;1H\u{1b}[9Cinfo\r\n\u{1b}[9Cmore")
+        #expect (imageCount (t, row: 0) == 1)
+        #expect (imageCount (t, row: 1) == 1)
+        #expect (images [0].replacedColumns.isEmpty)
+        #expect (images [1].replacedColumns.isEmpty)
+    }
+
+    @Test func testEraseCharsReplacesCells () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[4;1H\u{1b}[4X")
+        #expect (images [3].replacedColumns == IndexSet (integersIn: 0..<2))
+    }
+
+    @Test func testImagesScrollWithTheirRows () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[10;1H\n\n")
+        #expect (imageCount (t, row: 0) == 0 || (t.buffer.lines [t.buffer.yBase].images?.first as? MockCellImage) === images [2])
+        #expect ((t.buffer.lines [t.buffer.yBase + 1].images?.first as? MockCellImage) === images [3])
+    }
+
+    @Test func testScrollDownMovesImages () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[1T")
+        #expect (imageCount (t, row: 0) == 0)
+        #expect ((t.buffer.lines [t.buffer.yBase + 1].images?.first as? MockCellImage) === images [0])
+        #expect ((t.buffer.lines [t.buffer.yBase + 4].images?.first as? MockCellImage) === images [3])
+    }
+
+    @Test func testEraseDisplayRemovesAll () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[2J")
+        for row in 0..<4 {
+            #expect (imageCount (t, row: row) == 0)
+        }
+    }
+
+    private func linesWithImages (_ terminal: Terminal) -> [Int] {
+        (0..<terminal.buffer.lines.count).filter { !(terminal.buffer.lines [$0].images?.isEmpty ?? true) }
+    }
+
+    @Test func testInsertLineInsideImageRemovesWholeImage () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[3;1H\u{1b}[L")
+        #expect (linesWithImages (t).isEmpty)
+    }
+
+    @Test func testInsertLineAboveImageKeepsIt () {
+        let (t, images) = makeTerminal ()
+        t.feed (text: "\u{1b}[1;1H\u{1b}[L")
+        #expect (linesWithImages (t) == [1, 2, 3, 4])
+        #expect ((t.buffer.lines [1].images?.first as? MockCellImage) === images [0])
+    }
+
+    @Test func testDeleteLineInsideImageRemovesWholeImage () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[2;1H\u{1b}[M")
+        #expect (linesWithImages (t).isEmpty)
+    }
+
+    @Test func testScrollRegionSplittingImageRemovesIt () {
+        let (t, _) = makeTerminal ()
+        // Region rows 3..10 scrolls while rows 1..2 of the image stay put.
+        t.feed (text: "\u{1b}[3;10r\u{1b}[10;1H\n")
+        #expect (linesWithImages (t).isEmpty)
+    }
+
+    @Test func testNarrowingKeepsImageLinesUnwrapped () {
+        let (t, images) = makeTerminal ()
+        // Text to the right of the image on every image row, fastfetch-style.
+        for row in 1...4 {
+            t.feed (text: "\u{1b}[\(row);9Hinfo text")
+        }
+        t.feed (text: "\u{1b}[8;1H")
+        t.resize (cols: 12, rows: 10)
+        #expect (linesWithImages (t) == [0, 1, 2, 3])
+        #expect ((t.buffer.lines [3].images?.first as? MockCellImage) === images [3])
+    }
+
+    @Test func testWideningKeepsImage () {
+        let (t, _) = makeTerminal ()
+        t.feed (text: "\u{1b}[8;1H")
+        t.resize (cols: 40, rows: 10)
+        #expect (linesWithImages (t) == [0, 1, 2, 3])
+    }
+
+    @Test func testImagesWithoutCellFootprintAreUntouched () {
+        let terminal = Terminal(delegate: self, options: TerminalOptions(cols: 20, rows: 10))
+        terminal.buffer.attachImage (MockTerminalImage (), toLineAt: 0)
+        terminal.feed (text: "\u{1b}[1;1Hhello\u{1b}[2K")
+        #expect (terminal.buffer.lines [0].images?.count == 1)
     }
 }
 #endif

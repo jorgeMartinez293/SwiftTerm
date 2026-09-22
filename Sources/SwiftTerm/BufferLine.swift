@@ -82,6 +82,9 @@ public final class BufferLine: CustomDebugStringConvertible {
             return data [index]
         }
         set(value) {
+            if images != nil {
+                replaceImageCells (start: index, end: index + 1)
+            }
             if index >= dataSize {
                 // All bugs I was aware of have been handled, but keep this message here to
                 // help future refactorings.
@@ -127,6 +130,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     {
         let len = rightMargin + 1
         let pos = pos % len
+        if images != nil {
+            replaceImageCells (start: pos, end: len)
+        }
         if n < len - pos {
             for i in (0..<len-pos-n).reversed() {
                 data [pos+n+i] = data [pos+i]
@@ -146,6 +152,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     {
         let len = rightMargin + 1
         let p = pos % len
+        if images != nil {
+            replaceImageCells (start: p, end: len)
+        }
         if n < len - p {
             for i in 0..<len-pos-n {
                 data [pos+i] = data [pos+n+i]
@@ -163,6 +172,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Replaces the cells in the start to end range with the specified fill data
     public func replaceCells (start: Int, end: Int, fillData : CharData)
     {
+        if images != nil {
+            replaceImageCells (start: start, end: end)
+        }
         let length = dataSize
         var idx = start
         while idx < end && idx < length {
@@ -213,6 +225,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     /// Fills the entire bufferline with the specified ``CharData``
     public func fill (with: CharData)
     {
+        if images != nil {
+            replaceImageCells (start: 0, end: dataSize)
+        }
         data.update(repeating: with)
     }
 
@@ -223,6 +238,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - len: number of columns to fill
     public func fill (with: CharData, atCol: Int, len: Int)
     {
+        if images != nil {
+            replaceImageCells (start: atCol, end: atCol + len)
+        }
         for i in 0..<len {
             data [i+atCol] = with
         }
@@ -267,6 +285,9 @@ public final class BufferLine: CustomDebugStringConvertible {
     ///  - len: the number of elements to copy
     public func copyFrom (_ src: BufferLine, srcCol: Int, dstCol: Int, len: Int)
     {
+        if images != nil {
+            replaceImageCells (start: dstCol, end: dstCol + len)
+        }
         if src === self && srcCol > dstCol {
             // Overlapping forward copy: go left-to-right (already safe)
             for i in 0..<len {
@@ -335,6 +356,45 @@ public final class BufferLine: CustomDebugStringConvertible {
             images = imageArray
         } else {
             images = [image]
+        }
+    }
+
+    /// Text written into, or erased from, the cells `start..<end` replaces whatever part of
+    /// an attached image occupies them (see `TerminalImage.textCoveredColumns`), the same
+    /// as in terminals that store images as cells. Images whose every cell has been
+    /// replaced are dropped. The array itself is left in place, even if emptied, so the
+    /// buffer's count of lines holding images stays in step with `images != nil`.
+    /// True if an attached image occupies text cells on this line.
+    var hasTextCoveredImages: Bool {
+        images?.contains (where: { $0.textCoveredColumns > 0 }) ?? false
+    }
+
+    func replaceImageCells (start: Int, end: Int)
+    {
+        guard let current = images, start < end else {
+            return
+        }
+        var kept: [TerminalImage] = []
+        kept.reserveCapacity (current.count)
+        var changed = false
+        for var image in current {
+            let covered = image.textCoveredColumns
+            let first = max (start, image.col)
+            let last = min (end, image.col + covered)
+            if covered == 0 || first >= last {
+                kept.append (image)
+                continue
+            }
+            changed = true
+            var replaced = image.replacedColumns
+            replaced.insert (integersIn: (first - image.col)..<(last - image.col))
+            if replaced.count < covered {
+                image.replacedColumns = replaced
+                kept.append (image)
+            }
+        }
+        if changed {
+            images = kept
         }
     }
 

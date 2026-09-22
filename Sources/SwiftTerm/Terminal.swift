@@ -269,6 +269,30 @@ public protocol TerminalImage {
     
     /// Column where the image was attached
     var col: Int { get set }
+
+    /// Number of columns, starting at `col`, that this image occupies the way text does
+    /// (iTerm2 inline images, sixel): writing or erasing text in any of those cells
+    /// replaces that part of the image, as it does in other terminals. Zero for images
+    /// that are independent of the text grid (Kitty placements), which text never removes.
+    var textCoveredColumns: Int { get }
+
+    /// The columns of this image, relative to `col`, that text has since replaced and
+    /// so must no longer be drawn.
+    var replacedColumns: IndexSet { get set }
+
+    /// For an image drawn as one attached row per buffer line: an identity shared by all
+    /// of its rows, and which of its rows this is. Used to tell when an image's rows no
+    /// longer sit on consecutive lines, so it is removed instead of drawn torn apart.
+    var placementRow: (placement: ObjectIdentifier, row: Int)? { get }
+}
+
+extension TerminalImage {
+    public var textCoveredColumns: Int { 0 }
+    public var replacedColumns: IndexSet {
+        get { IndexSet () }
+        set { }
+    }
+    public var placementRow: (placement: ObjectIdentifier, row: Int)? { nil }
 }
 
 /**
@@ -2312,6 +2336,7 @@ open class Terminal {
                 buffer.lines.splice (start: row, deleteCount: 0, items: [newLine], change: { line in updateRange (line) })
             }
         }
+        buffer.removeTornImagesNearScreen ()
         // this.maxRange();
         updateRange (startLine: buffer.y, endLine: buffer.scrollBottom)
     }
@@ -4434,16 +4459,30 @@ open class Terminal {
 
         let columnCount = buffer.marginRight-buffer.marginLeft+1
         let rowCount = buffer.scrollBottom-buffer.scrollTop
+        // Rows are shifted by copying cells, which would erase any attached images; when
+        // whole rows move, move their images along with them instead.
+        let movesImages = columnCount == cols && buffer.hasAnyImages
         for _ in 0..<p {
             for i in (0..<rowCount).reversed() {
                 let src = buffer.lines [row+i]
                 let dst = buffer.lines [row+i+1]
-                
+                let srcImages = src.images
+
                 dst.copyFrom(src, srcCol: buffer.marginLeft, dstCol: buffer.marginLeft, len: columnCount)
+                if movesImages {
+                    dst.images = srcImages
+                }
             }
             let last = buffer.lines [row]
             last.fill (with: CharData (attribute: da), atCol: buffer.marginLeft, len: columnCount)
+            if movesImages {
+                last.images = nil
+            }
         }
+        if movesImages {
+            buffer.recalculateLinesWithImagesCount ()
+        }
+        buffer.removeTornImagesNearScreen ()
         // this.maxRange();
         updateRange (startLine: buffer.scrollTop, endLine: buffer.scrollBottom)
     }
@@ -4480,6 +4519,7 @@ open class Terminal {
                                      change: { line in updateRange (line) })
             }
         }
+        buffer.removeTornImagesNearScreen ()
         // this.maxRange();
         updateRange (startLine: buffer.scrollTop, endLine: buffer.scrollBottom)
     }
@@ -4555,7 +4595,8 @@ open class Terminal {
                 }
             }
         }
-        
+        buffer.removeTornImagesNearScreen ()
+
         // this.maxRange();
         updateRange (startLine: buffer.y, endLine: buffer.scrollBottom)
     }
@@ -5066,6 +5107,7 @@ open class Terminal {
                 }
             }
             lines [bottomRow] = BufferLine (from: newLine)
+            buffer.removeTornImagesNearScreen ()
         }
 
         // Move the viewport to the bottom of the buffer unless the user is
@@ -5527,6 +5569,7 @@ open class Terminal {
                     }
                     buffer.lines [topRow] = buffer.getBlankLine (attribute: eraseAttr ())
                 }
+                buffer.removeTornImagesNearScreen ()
                 updateRange (startLine: buffer.scrollTop, endLine: buffer.scrollBottom)
             }
         } else if buffer.y > 0 {

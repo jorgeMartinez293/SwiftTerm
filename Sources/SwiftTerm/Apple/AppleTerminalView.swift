@@ -1214,11 +1214,33 @@ extension TerminalView {
             if !otherImages.isEmpty {
                 for image in otherImages {
                     let col = image.col
+                    var size = CGSize (width: CGFloat (image.pixelWidth), height: CGFloat (image.pixelHeight))
+                    if image.placedCellSize.width > 0, image.placedCellSize.height > 0 {
+                        size.width *= cellDimension.width / image.placedCellSize.width
+                        size.height *= cellDimension.height / image.placedCellSize.height
+                    }
                     let rect = CGRect(x: CGFloat (col)*cellDimension.width,
-                                      y: rowBase - CGFloat (image.pixelHeight),
-                                      width: CGFloat (image.pixelWidth),
-                                      height: CGFloat (image.pixelHeight))
+                                      y: rowBase - size.height,
+                                      width: size.width,
+                                      height: size.height)
+                    if image.replacedColumns.isEmpty {
+                        image.draw (in: rect)
+                        continue
+                    }
+                    // Text has since been written over part of the image: leave those
+                    // cells to the text, like terminals that store images as cells.
+                    var visible: [CGRect] = []
+                    for column in 0..<image.textCoveredColumns where !image.replacedColumns.contains (column) {
+                        visible.append (CGRect (x: CGFloat (col + column) * cellDimension.width,
+                                                y: rect.minY,
+                                                width: cellDimension.width,
+                                                height: rect.height))
+                    }
+                    guard !visible.isEmpty else { continue }
+                    context.saveGState()
+                    context.clip(to: visible)
                     image.draw (in: rect)
+                    context.restoreGState()
                 }
             }
             switch renderMode {
@@ -1807,6 +1829,18 @@ extension TerminalView {
         var pixelWidth: Int
         var pixelHeight: Int
         var col: Int
+        var textCoveredColumns: Int = 0
+        var replacedColumns = IndexSet ()
+        /// Cell size the image was laid out against. If the font later changes, the
+        /// image is scaled by the same factor as the cells so it stays on its grid cells.
+        var placedCellSize: CGSize = .zero
+        /// Shared by every row of one placement; held here so its identity stays unique.
+        var placement: AnyObject?
+        var placementRowIndex: Int = 0
+        var placementRow: (placement: ObjectIdentifier, row: Int)? {
+            guard let placement else { return nil }
+            return (ObjectIdentifier (placement), placementRowIndex)
+        }
         var kittyIsKitty: Bool = false
         var kittyImageId: UInt32?
         var kittyImageNumber: UInt32?
@@ -2103,6 +2137,8 @@ extension TerminalView {
         
         let stripeSize = CGSize (width: width, height: cellDimension.height)
         var didScroll = false
+        final class Placement {}
+        let placement = Placement ()
         #if os(macOS)
         let unitRowHeight = cellDimension.height / height
         #else
@@ -2147,6 +2183,11 @@ extension TerminalView {
                 attachedImage.kittyRows = rows
                 attachedImage.kittyPixelOffsetX = context.pixelOffsetX
                 attachedImage.kittyPixelOffsetY = context.pixelOffsetY
+            } else {
+                attachedImage.textCoveredColumns = cols
+                attachedImage.placedCellSize = cellDimension
+                attachedImage.placement = placement
+                attachedImage.placementRowIndex = row
             }
             
             buffer.attachImage(attachedImage, toLineAt: buffer.y+buffer.yBase)
