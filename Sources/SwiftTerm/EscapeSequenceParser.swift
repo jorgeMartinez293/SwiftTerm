@@ -415,7 +415,15 @@ public class EscapeSequenceParser {
                 terminal.cmdSaveCursor(pars, collect)
             }
         case 0x74: terminal.csit(pars, collect)                 // t
-        case 0x75: terminal.cmdRestoreCursor(pars, collect)     // u
+        case 0x75:                                              // u
+            // Only a bare `CSI u` is SCORC. With a prefix (`CSI > flags u`, `CSI < u`,
+            // `CSI ? u`, `CSI = flags ; mode u`) it is the kitty keyboard protocol, which
+            // is not supported: leaving the query unanswered tells the program so, while
+            // treating these as a cursor restore teleported the cursor to the saved
+            // position (usually the top left) whenever such a program started or exited.
+            if collect.isEmpty {
+                terminal.cmdRestoreCursor(pars, collect)
+            }
         case 0x76: terminal.csiCopyRectangularArea(pars, collect) // v
         case 0x78: terminal.csiX(pars, collect)                 // x (DECFRA)
         case 0x79: terminal.cmdDECRQCRA(pars, collect)          // y
