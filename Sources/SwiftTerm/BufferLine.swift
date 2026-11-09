@@ -101,10 +101,14 @@ public final class BufferLine: CustomDebugStringConvertible {
         return Int (data [index].width)
     }
 
+    /// Resets the line to a blank one, as if newly created: line-level state goes too, or
+    /// a recycled line would keep the soft-wrap flag of whatever line it used to hold.
     func clear(with attribute: Attribute) {
         let empty = CharData(attribute: attribute)
         data.update(repeating: empty)
         images = nil
+        isWrapped = false
+        renderMode = .single
     }
     /// Test whether contains any chars.
     public func hasContent (index: Int) -> Bool {

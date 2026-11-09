@@ -1423,6 +1423,12 @@ open class Terminal {
         } else if by == rows - 1 {
         } else {
                 buffer.y = by + 1
+                // A row reached through an explicit line feed starts a new logical line, so
+                // it can't be the soft-wrapped continuation of the row above. Programs that
+                // redraw in place (Ink-based TUIs like Claude Code) write over rows that a
+                // resize reflow marked as wrapped; leaving the flag set chains their hard
+                // lines together and the next resize merges them into garbage.
+                buffer.lines [buffer.y + buffer.yBase].isWrapped = false
         }
         
         // If the end of the line is hit, prevent this action from wrapping around to the next line.
@@ -2188,17 +2194,32 @@ open class Terminal {
     {
         let p = pars.count == 0 ? 0 : pars [0]
         
+        // Erasing a whole row also drops its soft-wrap links (same as xterm.js): the row no
+        // longer continues the one above, and the row below no longer continues it. Without
+        // this, rows erased and redrawn in place stay chained and get merged on reflow.
         switch p {
         case 0:
-            eraseInBufferLine (y: buffer.y, start: buffer.x, end: cols)
+            eraseInBufferLine (y: buffer.y, start: buffer.x, end: cols, clearWrap: buffer.x == 0)
+            if buffer.x == 0 {
+                clearWrapOfNextLine ()
+            }
         case 1:
             eraseInBufferLine (y: buffer.y, start: 0, end: buffer.x + 1)
         case 2:
-            eraseInBufferLine (y: buffer.y, start: 0, end: cols)
+            eraseInBufferLine (y: buffer.y, start: 0, end: cols, clearWrap: true)
+            clearWrapOfNextLine ()
         default:
             break
         }
         updateRange (buffer.y)
+    }
+
+    func clearWrapOfNextLine ()
+    {
+        let next = buffer.y + buffer.yBase + 1
+        if next < buffer.lines.count {
+            buffer.lines [next].isWrapped = false
+        }
     }
 
     //
@@ -5062,6 +5083,9 @@ open class Terminal {
             if bottomRow == lines.count - 1 {
                 if willBufferBeTrimmed {
                     lines.recycle (clearAttribute: eraseAttr())
+                    // The recycled line is the new bottom row: it continues the row above
+                    // only when this scroll comes from an autowrap.
+                    lines [bottomRow].isWrapped = isWrapped
                 } else {
                     lines.push (BufferLine (from: newLine))
                 }
