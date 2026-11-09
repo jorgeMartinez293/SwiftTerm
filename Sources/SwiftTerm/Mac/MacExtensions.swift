@@ -30,16 +30,14 @@ extension NSColor {
     }
 
     /// Returns a dimmed version of the color (for SGR 2 faint/dim text attribute)
-    /// Reduces the color intensity by approximately 50%
-    func dimmedColor() -> NSColor {
+    /// Scales the color intensity by `factor` (1 = unchanged, 0 = black)
+    func dimmedColor(factor dimFactor: CGFloat = 0.5) -> NSColor {
         guard let color = self.usingColorSpace(.deviceRGB) else {
             return self
         }
 
         var red: CGFloat = 0.0, green: CGFloat = 0.0, blue: CGFloat = 0.0, alpha: CGFloat = 1.0
         color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
-        // Dim by reducing brightness to ~50% (blend toward black)
-        let dimFactor: CGFloat = 0.5
         return NSColor(calibratedRed: red * dimFactor, green: green * dimFactor, blue: blue * dimFactor, alpha: alpha)
     }
 

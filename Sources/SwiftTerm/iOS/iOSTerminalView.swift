@@ -995,6 +995,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         set { caretView?.caretTextColor = newValue }
     }
     
+    /// Replaces specific 24-bit foreground/background colors when drawing, keyed by packed
+    /// `0xRRGGBB`. Lets a host remap fixed colors that apps hardcode (e.g. a gray that is
+    /// unreadable on the host's background).
+    public var trueColorOverrides: [UInt32: UIColor] = [:] {
+        didSet { colorsChanged() }
+    }
+
+    /// Brightness multiplier applied to dim/faint (SGR 2) text: 1 = unchanged, 0 = black.
+    public var dimFactor: CGFloat = 0.5 {
+        didSet { colorsChanged() }
+    }
+
     /// Controls weather to use high ansi colors, if false terminal will use bold text instead of high ansi colors
     public var useBrightColors: Bool = true
 

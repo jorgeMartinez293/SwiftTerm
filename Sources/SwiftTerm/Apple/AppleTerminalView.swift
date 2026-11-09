@@ -218,6 +218,9 @@ extension TerminalView {
             colors [midx] = newColor
             return newColor
         case .trueColor(let r, let g, let b):
+            if let override = trueColorOverrides [(UInt32 (r) << 16) | (UInt32 (g) << 8) | UInt32 (b)] {
+                return override
+            }
             if let tc = trueColors [color] {
                 return tc
             }
@@ -395,7 +398,7 @@ extension TerminalView {
         var fgColor = mapColor (color: fg, isFg: true, isBold: isBold, useBrightColors: useBrightColors)
         // Apply dim/faint attribute (SGR 2) - reduce color intensity
         if flags.contains(.dim) {
-            fgColor = fgColor.dimmedColor()
+            fgColor = fgColor.dimmedColor(factor: dimFactor)
         }
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
